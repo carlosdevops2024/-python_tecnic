@@ -1,0 +1,155 @@
+trigger:
+  branches:
+    exclude:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: Aws_credentials
+
+stages:
+  - stage: BuildAndTest
+    jobs:
+      - job: BuildAndTest
+        steps:
+          - script: |
+              echo "Instalando dependencias"
+              pip install -r requirements.txt
+            displayName: 'Instalar dependencias'
+
+          - script: |
+              echo "Compilando aplicación"
+              python -m compileall src
+            displayName: 'Compilar aplicación'
+
+          - script: |
+              echo "Ejecutando pruebas unitarias"
+              python -m unittest discover -s tests
+            displayName: 'Ejecutar pruebas unitarias'
+
+          - script: |
+              echo "Ejecutando análisis de código estático"
+              python run_static_analysis.py
+            displayName: 'Análisis de código estático'
+
+          - script: |
+              echo "Ejecutando análisis de vulnerabilidades"
+              bandit -r src tests
+            displayName: 'Análisis de vulnerabilidades'
+
+          - script: |
+              echo "Empaquetando la aplicación en un archivo .zip"
+              zip -r $(Build.ArtifactStagingDirectory)/myapp.zip src/ || { echo "Error al empaquetar la aplicación"; exit 1; }
+              echo "Archivo .zip creado correctamente en $(Build.ArtifactStagingDirectory)"
+            displayName: 'Empaquetar aplicación en .zip'
+
+          - script: |
+              echo "Verificando contenido del directorio de artefactos"
+              ls -la $(Build.ArtifactStagingDirectory)
+            displayName: 'Verificar contenido del directorio de artefactos'
+
+          - script: |
+              echo "Subiendo el archivo .zip a S3"
+              if [ -f "$(Build.ArtifactStagingDirectory)/myapp.zip" ]; then
+                aws s3 cp $(Build.ArtifactStagingDirectory)/myapp.zip s3://carlos-ortiz-s3/myapp.zip --region us-east-1 || { echo "Error al subir el archivo a S3"; exit 1; }
+              else
+                echo "Archivo .zip no encontrado, no se puede subir a S3"
+                exit 1
+              fi
+            displayName: 'Subir archivo .zip a S3'
+
+          - publish: $(Build.ArtifactStagingDirectory)/myapp.zip
+            artifact: MyAppArtifact
+            displayName: 'Publicar artefacto .zip'
+
+          - task: Docker@2
+            inputs:
+              command: 'buildAndPush'
+              repository: 'crls220/myapp123'
+              dockerfile: '**/Dockerfile'
+              containerRegistry: 'docker'
+              tags: '$(Build.BuildId)'
+            displayName: 'Construir y Push Imagen Docker'   
+
+  - stage: DeployInfrastructure
+    dependsOn: BuildAndTest
+    jobs:
+      - job: Terraform
+        steps:
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '1.4.0'
+            displayName: 'Instalar Terraform'
+
+          - script: |
+              echo "Configurando las credenciales de AWS"
+              export AWS_ACCESS_KEY_ID=$(AWS_ACCESS_KEY_ID)
+              export AWS_SECRET_ACCESS_KEY=$(AWS_SECRET_ACCESS_KEY)
+            displayName: 'Configurar Credenciales de AWS'
+
+          - script: |
+              echo "Inicializando Terraform"
+              terraform init
+            workingDirectory: 'infra'
+            displayName: 'Inicializar Terraform'
+
+          - script: |
+              echo "Creando plan de infraestructura"
+              terraform plan -out=tfplan
+            workingDirectory: 'infra'
+            displayName: 'Planificar Terraform'
+
+          - script: |
+              echo "Aplicando cambios de infraestructura"
+              terraform apply -auto-approve tfplan
+
+              echo "Obteniendo la IP de la instancia EC2"
+              terraform output -raw ec2_ip > ec2_ip.txt
+
+              echo "Obteniendo la clave privada"
+              terraform output -raw key_pair_private_key > $(Build.ArtifactStagingDirectory)/key_carlos_pem.pem
+
+              echo "Leyendo la IP de la instancia EC2"
+              EC2_IP=$(cat ec2_ip.txt)
+              echo "La IP obtenida es: $EC2_IP"
+
+              echo "##vso[task.setvariable variable=EC2_IP]$EC2_IP"
+            workingDirectory: 'infra'
+            displayName: 'Aplicar Terraform y Exportar IP EC2 y Clave PEM'
+
+  - stage: DeployToMinikube
+    dependsOn: DeployInfrastructure
+    condition: succeeded()
+    pool:
+      name: MyAgentPool
+    jobs:
+      - job: Deploy
+        steps:
+          - task: KubectlInstaller@0
+            inputs:
+              kubectlVersion: 'latest'
+            displayName: 'Instalar Kubectl'
+
+          - script: |
+              echo "Configurando contexto de Kubernetes"
+              kubectl config use-context minikube
+            displayName: 'Configurar Contexto de Kubernetes'
+
+          - script: |
+              echo "Verificando conexión con el cluster Minikube"
+              kubectl cluster-info
+            displayName: 'Verificar Conexión con el Cluster'
+
+          - script: |
+              echo "Desplegando la aplicación en Minikube"
+              kubectl apply -f k8s/deployment.yaml
+              kubectl apply -f k8s/service.yaml
+
+              echo "Esperando que el despliegue se complete"
+              kubectl rollout status deployment/myapp-deployment || { echo 'Rollout failed'; exit 1; }
+
+              echo "Obteniendo información sobre los pods"
+              kubectl get pods --selector=app=myapp
+            displayName: 'Desplegar en Minikube y Revisar Logs'
